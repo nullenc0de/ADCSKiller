@@ -526,12 +526,12 @@ class ADCSExploit:
                         template_vulns = template["[!] Vulnerabilities"]
                         template_name = template.get("Template Name")
                         
-                        for i in range(1, 12):  # ESC1-ESC11
-                            esc_name = f'ESC{i}'
-                            if esc_name in template_vulns and template_vulns[esc_name]:
-                                if esc_name not in self.vulnerable_certificate_templates:
-                                    self.vulnerable_certificate_templates[esc_name] = []
-                                self.vulnerable_certificate_templates[esc_name].append(template_name)
+                        # Dynamically detect all ESC vulnerabilities (ESC1, ESC2, ..., ESC15, etc.)
+                        for vuln_key, vuln_value in template_vulns.items():
+                            if vuln_key.startswith('ESC') and vuln_value:
+                                if vuln_key not in self.vulnerable_certificate_templates:
+                                    self.vulnerable_certificate_templates[vuln_key] = []
+                                self.vulnerable_certificate_templates[vuln_key].append(template_name)
                 
                 if self.vulnerable_certificate_templates:
                     self.logger.info("Found vulnerable certificate templates:")
@@ -1613,4 +1613,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()  
+    main() 
