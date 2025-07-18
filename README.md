@@ -2,28 +2,36 @@
 
 ADCSKiller is a Python-based tool designed to automate the process of discovering and exploiting Active Directory Certificate Services (ADCS) vulnerabilities. It leverages features of Certipy and Coercer to simplify the process of attacking ADCS infrastructure. This enhanced version includes full LDAPS support, multiple authentication methods, and improved error handling.
 
-![image](https://github.com/grimlockx/ADCSKiller/assets/95048484/e4102251-cd50-4f74-b8c1-578677d35d0c)
-
 ## Features
 
 ### Core Functionality
+
 - **LDAP/LDAPS Enumeration**: Full support for both LDAP (389) and LDAPS (636) with TLS channel binding
 - **Multiple Authentication Methods**: Password, NTLM hash, Kerberos tickets, and AES keys
-- **Domain Enumeration**: 
+- **Domain Enumeration**:
   - Domain Administrators via LDAP/LDAPS
   - Domain Controllers via LDAP/LDAPS
   - Certificate Authorities via Certipy
-- **ADCS Exploitation**:
-  - ESC1 (Template allows SAN specification)
-  - ESC8 (HTTP/RPC Relay attacks)
+
+### Automated ADCS Exploitation
+
+- **ESC1**: Abuses misconfigured certificate templates that allow subject alternative name (SAN) specification.
+- **ESC2**: Exploits templates with the "Any Purpose" or no specified Enhanced Key Usage (EKU).
+- **ESC3**: Abuses templates configured for "Certificate Request Agent" (Enrollment Agent).
+- **ESC4**: Exploits templates with weak access control permissions.
+- **ESC6**: Takes advantage of CAs configured with EDITF_ATTRIBUTESUBJECTALTNAME2.
+- **ESC8**: Automates the NTLM relay attack to the CA's HTTP/RPC endpoints.
+- **ESC15**: Exploits Schema Version 1 templates that allow EKU specification (EKUwu).
 
 ### Enhanced Security Features
+
 - **LDAPS Support**: Secure LDAP connections with SSL/TLS
 - **Channel Binding**: LDAP channel binding for enhanced security
 - **Kerberos Integration**: Full Kerberos authentication support
 - **Flexible Authentication**: Support for various credential formats
 
 ### Operational Improvements
+
 - **Enhanced Logging**: File and console logging with verbosity controls
 - **Error Handling**: Comprehensive exception handling and timeout management
 - **Modular Architecture**: Clean separation of concerns with dedicated classes
@@ -106,23 +114,27 @@ python3 adcskiller.py -d domain.com -u username -p password -dc-ip 10.0.0.1 -L a
 ## Command Line Options
 
 ### Required Arguments
+
 - `-d, --domain`: Target domain name (FQDN)
 - `-u, --username`: Username for authentication
 - `-dc-ip, --target`: IP address of the domain controller
 - `-L, --lhost`: FQDN of the listener machine
 
 ### Authentication (choose one)
+
 - `-p, --password`: Password for authentication
 - `-H, --hash`: NTLM hash for authentication (LM:NT format)
 - `-K, --kerberos-ticket`: Path to Kerberos ticket file
 - `-A, --aes-key`: AES key for Kerberos authentication
 
 ### LDAP Options
+
 - `--ldaps`: Use LDAPS instead of LDAP (port 636)
 - `--ldap-channel-binding`: Use LDAP channel binding (requires LDAPS)
 - `--ldap-port`: Custom LDAP port
 
 ### Additional Options
+
 - `-o, --output`: Output directory (default: current directory)
 - `--timeout`: Timeout for LDAP operations (default: 100 seconds)
 - `--dns-tcp`: Use TCP for DNS queries
@@ -133,9 +145,9 @@ python3 adcskiller.py -d domain.com -u username -p password -dc-ip 10.0.0.1 -L a
 
 The tool generates comprehensive logs and saves results to the specified output directory:
 
-- **adcskiller.log**: Detailed execution log
-- **[timestamp]_Certipy.json**: Certipy enumeration results
-- **Certificate files**: Generated certificates (when exploitation succeeds)
+- `adcskiller.log`: Detailed execution log
+- `[timestamp]_Certipy.json`: Certipy enumeration results
+- Certificate files: Generated certificates (when exploitation succeeds)
 
 ## Security Considerations
 
@@ -147,22 +159,18 @@ The tool generates comprehensive logs and saves results to the specified output 
 ## Todos
 
 ### High Priority
+
 - [ ] **ESC2-ESC7 Support**: Implement remaining ESC exploitation techniques
 - [ ] **ESC9-ESC11 Support**: Add support for newer ADCS vulnerabilities
 - [ ] **DC Certificate Authorities**: Enhanced support for Domain Controller CAs
 - [ ] **DCSync Integration**: Automated DCSync functionality post-exploitation
 
 ### Medium Priority
+
 - [ ] **ADIDNS Automation**: Automated ADIDNS entry creation when required
 - [ ] **Enhanced Enumeration**: Principals allowed to perform DCSync
 - [ ] **Alternative Tools**: Integration with dirkjanm's gettgtpkinit.py
 - [ ] **Certificate Templates**: More comprehensive template enumeration
-
-### Low Priority
-- [ ] **Test Suite**: Comprehensive unit and integration tests
-- [ ] **Configuration Files**: Support for configuration file input
-- [ ] **Reporting**: Enhanced HTML/PDF reporting capabilities
-- [ ] **Multi-threading**: Parallel processing for large environments
 
 ## Troubleshooting
 
@@ -194,11 +202,10 @@ python3 adcskiller.py ... --timeout 300
 
 ## Credits
 
-- [Oliver Lyak](https://github.com/ly4k/Certipy "Certipy") for Certipy
-- [p0dalirius](https://github.com/p0dalirius/Coercer "Coercer") for Coercer
-- [SpecterOps](https://specterops.io/) for their groundbreaking research on ADCS
-- [S3cur3Th1sSh1t](https://github.com/S3cur3Th1sSh1t) for bringing these attacks to broader attention
-- [lefayjey](https://github.com/lefayjey/linWinPwn) for linWinPwn inspiration and LDAPS implementation patterns
+- Oliver Lyak for [Certipy](https://github.com/ly4k/Certipy)
+- p0dalirius for [Coercer](https://github.com/p0dalirius/Coercer)
+- SpecterOps for their groundbreaking research on ADCS
+- S3cur3Th1sSh1t for bringing these attacks to broader attention
 
 ## License
 
