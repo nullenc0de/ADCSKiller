@@ -1496,7 +1496,7 @@ def main():
     
     print(banner)
     print("ADCSKiller v0.4 - Enhanced ADCS Exploitation Tool")
-    print("by Maurice Fielenbach (grimlockx) - Improved with LDAPS support")
+    print("by Maurice Fielenbach (grimlockx) - Updated by Paul Seekamp (nullenc0de)")
     print()
     
     parser = argparse.ArgumentParser(
